@@ -131,6 +131,7 @@ async def main(args):
                 tts_audio += response.tts_audio
                 logging.info(f'Received audio chunk {len(response.tts_audio)} bytes, chunk index: {chunk_index},' +
                              f'cost {time.time() - last_time:.3f}s  all cost {time.time() - start_time:.3f}s ')
+
                 last_time = time.time()
                 chunk_index += 1
 
@@ -138,14 +139,16 @@ async def main(args):
             if args.format is None or args.format in {'', 'pcm'}:
                 tts_array = convert_audio_bytes_to_ndarray(tts_audio, args.format)
                 # 保存为 (samples, 1) 格式
+
                 sf.write(
                     args.output_path,
                     tts_array.T,  # 转置为 (samples, 1)
                     args.target_sr
                 )
                 duration = tts_array.shape[1] / args.target_sr
+                all_time = time.time() - start_time
                 logging.info(f'Audio saved to {args.output_path} (duration: {duration:.2f}s) '+
-                             f'cost {time.time() - last_time:.3f}s  all cost {time.time() - start_time:.3f}s ')
+                             f'cost {time.time() - last_time:.3f}s  all cost {all_time:.3f}s, rtf: {all_time / duration:.3f}')
             else:
                 logging.error(f"Unsupported format: {args.format}")
 
@@ -153,6 +156,22 @@ async def main(args):
             logging.error(f"RPC error occurred: {e.code()}: {e.details()}")
         except Exception as e:
             logging.error(f"Processing failed: {str(e)}", exc_info=True)
+
+
+def run_async_main(args):
+    asyncio.run(main(args))
+
+import multiprocessing
+def multiprocess_main(args, max_conc):
+    multiprocessing.set_start_method('spawn', force=True)
+    processes = []
+    for _ in range(max_conc):
+        p = multiprocessing.Process(target=run_async_main, args=(args,))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
 
 
 if __name__ == "__main__":
@@ -180,5 +199,7 @@ if __name__ == "__main__":
 
     # 运行异步主函数
     asyncio.run(main(args))
+
+    # multiprocess_main(args, 16)
 
     # python client.py --mode zero_shot_by_spk_id --spk_id 001 --stream_input --tts_text 你好，请问有什么可以帮您的吗？ --format "" --stream

@@ -26,6 +26,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from cosyvoice.flow.flow import CausalMaskedDiffWithXvec
+from cosyvoice.flow.flow_matching import EstimatorWrapper
 from cosyvoice.hifigan.generator import HiFTGenerator
 from cosyvoice.utils.common import fade_in_out
 from cosyvoice.utils.file_utils import convert_onnx_to_trt
@@ -54,6 +55,7 @@ class AsyncWrapper:
 def tensor_to_list(tensor: torch.tensor):
     return tensor.view(-1).cpu().numpy().tolist()
 
+
 class CosyVoice2Model:
 
     def __init__(self,
@@ -69,8 +71,15 @@ class CosyVoice2Model:
             **ENGINE_ARGS,
         )
         self.llm_engine: AsyncLLMEngine = AsyncLLMEngine.from_engine_args(engine_args)
-        self.thread_executor = ThreadPoolExecutor(max_workers=10)
+        self.thread_count = 10
+        self.thread_executor = ThreadPoolExecutor(max_workers=self.thread_count)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.stream_pool = queue.Queue()
+        for _ in range(self.thread_count):
+            stream = torch.cuda.Stream(self.device)
+            self.stream_pool.put(stream)
+
         self.flow = flow
         self.hift = hift
         self.fp16 = fp16
@@ -139,7 +148,7 @@ class CosyVoice2Model:
             self.flow.decoder.estimator_engine = trt.Runtime(trt.Logger(trt.Logger.INFO)).deserialize_cuda_engine(f.read())
         if self.flow.decoder.estimator_engine is None:
             raise ValueError('failed to load trt {}'.format(flow_decoder_estimator_model))
-        self.flow.decoder.estimator = self.flow.decoder.estimator_engine.create_execution_context()
+        self.flow.decoder.estimator = EstimatorWrapper(self.flow.decoder.estimator_engine, estimator_count=2)
         # TODO: 如何限制内存
         # 启动后会占用较多显存
         # [TRT] [I] Loaded engine size: 158 MiB
@@ -191,7 +200,6 @@ class CosyVoice2Model:
             prompt_token_ids = [self.sos_eos_token_id]
             text_tokens_cache = prompt_text
             async for this_text in text:
-                logging.info(f"this_text: {this_text}")
                 this_text = tensor_to_list(this_text + torch.tensor(6564))
                 # text need tokens
                 text_tokens_cache += this_text
@@ -253,38 +261,43 @@ class CosyVoice2Model:
 
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, uuid, token_offset, finalize=False, speed=1.0):
-        tts_mel, _ = self.flow.inference(token=token.to(self.device),
-                                         token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
-                                         prompt_token=prompt_token.to(self.device),
-                                         prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
-                                         prompt_feat=prompt_feat.to(self.device),
-                                         prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
-                                         embedding=embedding.to(self.device),
-                                         finalize=finalize)
-        tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]
-        # append hift cache
-        if self.hift_cache_dict[uuid] is not None:
-            hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
-            tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
-        else:
-            hift_cache_source = torch.zeros(1, 1, 0)
-        # keep overlap mel and hift cache
-        if finalize is False:
-            tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+        torch.cuda.current_stream().synchronize() # 将当前流进行同步了再处理后续逻辑
+        stream = self.stream_pool.get()
+        with torch.cuda.stream(stream):
+            tts_mel, _ = self.flow.inference(token=token.to(self.device),
+                                             token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                             prompt_token=prompt_token.to(self.device),
+                                             prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
+                                             prompt_feat=prompt_feat.to(self.device),
+                                             prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
+                                             embedding=embedding.to(self.device),
+                                             finalize=finalize)
+            tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]
+            # append hift cache
             if self.hift_cache_dict[uuid] is not None:
-                tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
-            self.hift_cache_dict[uuid] = {'mel': tts_mel[:, :, -self.mel_cache_len:],
-                                          'source': tts_source[:, :, -self.source_cache_len:],
-                                          'speech': tts_speech[:, -self.source_cache_len:]}
-            tts_speech = tts_speech[:, :-self.source_cache_len]
-        else:
-            if speed != 1.0:
-                assert self.hift_cache_dict[uuid] is None, 'speed change only support non-stream inference mode'
-                tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
-            tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
-            if self.hift_cache_dict[uuid] is not None:
-                tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
-        return tts_speech
+                hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
+                tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
+            else:
+                hift_cache_source = torch.zeros(1, 1, 0)
+            # keep overlap mel and hift cache
+            if finalize is False:
+                tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+                if self.hift_cache_dict[uuid] is not None:
+                    tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+                self.hift_cache_dict[uuid] = {'mel': tts_mel[:, :, -self.mel_cache_len:],
+                                              'source': tts_source[:, :, -self.source_cache_len:],
+                                              'speech': tts_speech[:, -self.source_cache_len:]}
+                tts_speech = tts_speech[:, :-self.source_cache_len]
+            else:
+                if speed != 1.0:
+                    assert self.hift_cache_dict[uuid] is None, 'speed change only support non-stream inference mode'
+                    tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
+                tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+                if self.hift_cache_dict[uuid] is not None:
+                    tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+            torch.cuda.synchronize(torch.cuda.current_stream())
+            self.stream_pool.put(stream)
+            return tts_speech
 
     async def async_tts(self, text, flow_embedding, llm_embedding=torch.zeros(0, 192),
             prompt_text=torch.zeros(1, 0, dtype=torch.int32),
